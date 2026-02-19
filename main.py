@@ -1,7 +1,6 @@
 """
 Bankruptcy Prediction API — FastAPI Backend
-Trains a LightGBM model on startup from the combined 128K-row dataset
-(US + Taiwan + Poland). No pickle files required.
+Trains a LightGBM model on startup from taiwan_bankruptcy.csv
 """
 
 import os
@@ -9,7 +8,6 @@ import sys
 import json
 import logging
 import warnings
-import re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -22,10 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from sklearn.model_selection import train_test_split
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder, OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, f1_score,
     precision_score, recall_score
@@ -34,16 +29,10 @@ from sklearn.metrics import (
 import lightgbm as lgb
 from imblearn.over_sampling import SMOTE
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bankruptcy-api")
 
-# ─── App ─────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Bankruptcy Risk Prediction API",
-    description="Real predictions from LightGBM trained on 128,906 companies (US + Taiwan + Poland)",
-    version="3.0.0",
-)
+app = FastAPI(title="Bankruptcy Risk Prediction API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,152 +42,121 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Global State ────────────────────────────────────────────────────────────
 SEED = 42
 trained_model = None
-preproc = None
+scaler = None
 feature_columns = None
-numeric_cols = None
-cat_cols = None
 model_metrics = None
-
-# ─── Data Paths ──────────────────────────────────────────────────────────────
-POSSIBLE_PATHS = [
-    "combined_raw.csv",
-    "data/combined_raw.csv",
-    "../data/combined_raw.csv",
-    os.path.join(os.path.dirname(__file__), "combined_raw.csv"),
-    os.path.join(os.path.dirname(__file__), "data", "combined_raw.csv"),
-]
+norm_to_original = {}
 
 
 def find_data():
-    for p in POSSIBLE_PATHS:
+    candidates = [
+        "taiwan_bankruptcy.csv",
+        "data/taiwan_bankruptcy.csv",
+        "combined_raw.csv",
+        "data/combined_raw.csv",
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
     return None
 
 
-# ─── Training ────────────────────────────────────────────────────────────────
+def normalize_col_name(col):
+    import re
+    c = col.strip().lower()
+    c = c.replace("%", "").replace("(", "").replace(")", "")
+    c = c.replace("/", "_").replace("'", "_").replace("'", "_")
+    c = re.sub(r"[^a-z0-9]+", "_", c)
+    c = c.strip("_")
+    return c
+
+
 def train_model():
-    global trained_model, preproc, feature_columns, numeric_cols, cat_cols, model_metrics
+    global trained_model, scaler, feature_columns, model_metrics, norm_to_original
 
     data_path = find_data()
     if data_path is None:
-        logger.warning("combined_raw.csv not found! Place it next to main.py or in data/")
+        logger.warning("No CSV found! Place taiwan_bankruptcy.csv next to main.py")
         return False
 
     logger.info(f"Loading {data_path}...")
     df = pd.read_csv(data_path)
     logger.info(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
-    # ── Find target ──
-    if "y" not in df.columns:
-        logger.error("No 'y' column found in combined_raw.csv")
+    # ── Find target column ──
+    target_col = None
+
+    # Check for 'y' first (combined dataset)
+    if "y" in df.columns:
+        target_col = "y"
+    else:
+        # Search for bankrupt-style column
+        for col in df.columns:
+            col_clean = col.strip().lower().replace("?", "")
+            if "bankrupt" in col_clean:
+                target_col = col
+                break
+
+    if target_col is None:
+        # Last resort: try first column
+        logger.warning(f"No target column found. Columns: {list(df.columns[:10])}")
         return False
 
-    # ── Drop leaky columns ──
-    drop_cols = ["status_label"]
-    for c in drop_cols:
-        if c in df.columns:
-            df = df.drop(columns=[c])
-            logger.info(f"Dropped leaky column: {c}")
+    logger.info(f"Using target column: '{target_col}'")
 
-    # ── Drop columns with >95% correlation (same logic as your notebook) ──
-    num_only = df.select_dtypes(include=["number"]).drop(columns=["y"], errors="ignore")
-    corr_matrix = num_only.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    high_corr_cols = [col for col in upper.columns if any(upper[col] > 0.95)]
-    if high_corr_cols:
-        df = df.drop(columns=high_corr_cols, errors="ignore")
-        logger.info(f"Dropped {len(high_corr_cols)} highly correlated columns")
+    # ── Drop leaky columns ──
+    for c in ["status_label", "dataset_source", "horizon_years"]:
+        if c in df.columns and c != target_col:
+            df = df.drop(columns=[c])
 
     # ── Separate X / y ──
-    y = df["y"].astype(int)
-    X = df.drop(columns=["y"])
+    y = df[target_col].astype(int)
+    X = df.drop(columns=[target_col])
 
-    # ── Identify column types ──
-    numeric_cols = X.select_dtypes(include=["number"]).columns.tolist()
-    cat_cols = [c for c in X.columns if c not in numeric_cols and c != "dataset_source"]
-    ohe_cols = ["dataset_source"] if "dataset_source" in X.columns else []
+    # Drop any remaining non-numeric columns
+    non_numeric = X.select_dtypes(exclude=["number"]).columns.tolist()
+    if non_numeric:
+        logger.info(f"Dropping non-numeric columns: {non_numeric}")
+        X = X.drop(columns=non_numeric)
 
-    # Store feature columns for mapping later
+    X.columns = X.columns.str.strip()
     feature_columns = list(X.columns)
-    logger.info(f"Features: {len(numeric_cols)} numeric, {len(cat_cols)} categorical, {len(ohe_cols)} OHE")
 
-    # ── Preprocessing pipeline (matches your notebook exactly) ──
-    num_tf = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+    # Build normalized name mapping
+    norm_to_original = {}
+    for col in feature_columns:
+        norm = normalize_col_name(col)
+        norm_to_original[norm] = col
 
-    ohe_tf = Pipeline([("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))])
+    logger.info(f"Features: {len(feature_columns)}, Positive rate: {y.mean():.4f}")
 
-    from sklearn.preprocessing import FunctionTransformer
+    # ── Split ──
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=SEED
+    )
 
-    def to_str(X):
-        return X.astype(str)
-
-    cat_tf = Pipeline([
-        ("to_str", FunctionTransformer(to_str)),
-        ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-        ("ord", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
-    ])
-
-    transformers = [("num", num_tf, numeric_cols)]
-    if ohe_cols:
-        transformers.append(("ohe_src", ohe_tf, ohe_cols))
-    if cat_cols:
-        transformers.append(("cat", cat_tf, cat_cols))
-
-    preproc = ColumnTransformer(transformers, remainder="drop")
-
-    # ── Stratified split per dataset source ──
-    train_parts, test_parts = [], []
-    for src in X["dataset_source"].unique() if "dataset_source" in X.columns else ["all"]:
-        if src == "all":
-            mask = pd.Series(True, index=X.index)
-        else:
-            mask = X["dataset_source"] == src
-        X_src = X[mask]
-        y_src = y[mask]
-        if len(X_src) < 10:
-            train_parts.append((X_src, y_src))
-            continue
-        Xtr, Xte, ytr, yte = train_test_split(
-            X_src, y_src, test_size=0.2, stratify=y_src, random_state=SEED
-        )
-        train_parts.append((Xtr, ytr))
-        test_parts.append((Xte, yte))
-
-    X_train = pd.concat([p[0] for p in train_parts], ignore_index=True)
-    y_train = pd.concat([p[1] for p in train_parts], ignore_index=True)
-    X_test = pd.concat([p[0] for p in test_parts], ignore_index=True)
-    y_test = pd.concat([p[1] for p in test_parts], ignore_index=True)
-
-    logger.info(f"Train: {len(X_train)}, Test: {len(X_test)}, Positive rate: {y_train.mean():.4f}")
-
-    # ── Fit preprocessor and transform ──
-    preproc.fit(X_train)
-    X_train_t = preproc.transform(X_train)
-    X_test_t = preproc.transform(X_test)
+    # ── Scale ──
+    scaler = StandardScaler()
+    X_train_s = pd.DataFrame(scaler.fit_transform(X_train), columns=feature_columns, index=X_train.index)
+    X_test_s = pd.DataFrame(scaler.transform(X_test), columns=feature_columns, index=X_test.index)
 
     # ── SMOTE ──
     sm = SMOTE(random_state=SEED)
-    X_train_res, y_train_res = sm.fit_resample(X_train_t, y_train)
-    logger.info(f"After SMOTE: {len(X_train_res)} training samples")
+    X_train_res, y_train_res = sm.fit_resample(X_train_s, y_train)
+    logger.info(f"After SMOTE: {len(X_train_res)} samples")
 
-    # ── Internal validation split for early stopping ──
+    # ── Early stopping split ──
     X_tr_f, X_val_f, y_tr_f, y_val_f = train_test_split(
         X_train_res, y_train_res, test_size=0.15, random_state=SEED, stratify=y_train_res
     )
 
-    # ── Train LightGBM ──
+    # ── Train ──
     trained_model = lgb.LGBMClassifier(
-        objective="binary",
-        random_state=SEED,
-        n_estimators=3000,
-        learning_rate=0.03,
-        num_leaves=31,
-        n_jobs=-1,
-        verbose=-1,
+        objective="binary", random_state=SEED,
+        n_estimators=2000, learning_rate=0.03, num_leaves=31,
+        n_jobs=-1, verbose=-1,
     )
     trained_model.fit(
         X_tr_f, y_tr_f,
@@ -210,8 +168,8 @@ def train_model():
         ],
     )
 
-    # ── Evaluate on held-out test ──
-    proba = trained_model.predict_proba(X_test_t)[:, 1]
+    # ── Evaluate ──
+    proba = trained_model.predict_proba(X_test_s)[:, 1]
     preds = (proba >= 0.5).astype(int)
 
     model_metrics = {
@@ -222,32 +180,19 @@ def train_model():
         "f1": round(float(f1_score(y_test, preds)), 4),
         "training_samples": int(len(X_train_res)),
         "test_samples": int(len(X_test)),
-        "features": int(X_train_t.shape[1]),
-        "datasets": "US + Taiwan + Poland (128,906 companies)",
+        "features": int(len(feature_columns)),
         "best_iteration": int(trained_model.best_iteration_),
     }
     logger.info(f"Model trained! {json.dumps(model_metrics, indent=2)}")
     return True
 
 
-# ─── Map user financial inputs → model features ─────────────────────────────
 def map_user_inputs_to_features(data: dict) -> tuple:
-    """
-    Convert financial statement inputs to a DataFrame matching
-    the combined dataset's columns. Unmapped features stay NaN
-    and get median-imputed by the preprocessor.
-    """
     if feature_columns is None:
         raise RuntimeError("Model not trained")
 
-    row = {col: np.nan for col in feature_columns}
+    row = {col: 0.0 for col in feature_columns}
 
-    # Metadata
-    row["dataset_source"] = "us"
-    if "horizon_years" in row:
-        row["horizon_years"] = 1
-
-    # Raw inputs
     ta = data.get("totalAssets", 0) or 1
     tl = data.get("totalLiabilities", 0) or 1
     ca = data.get("currentAssets", 0) or 0
@@ -263,146 +208,133 @@ def map_user_inputs_to_features(data: dict) -> tuple:
     dep = data.get("depreciation", 0) or 0
     cash = data.get("cash") or (ca * 0.3)
     wc = ca - cl
-    gp = rev * 0.4  # estimate without COGS
+    gp = rev * 0.4
 
     def safe(n, d):
-        return n / d if d and d != 0 else np.nan
+        return n / d if d and d != 0 else 0.0
 
-    # ── US features (X1-X18) ──
-    us_map = {
-        "X1": safe(ni, ta),
-        "X2": safe(ni, rev),
-        "X3": safe(ca, cl),
-        "X4": safe(tl, ta),
-        "X5": safe(td, te),
-        "X6": safe(ebit, ta),
-        "X7": safe(rev, ta),
-        "X8": safe(wc, ta),
-        "X10": safe(ebit, ie),
-        "X11": safe(cfo, td),
-        "X13": safe(ni, te),
-        "X14": safe(ca, ta),
-        "X15": safe(cl, tl),
-        "X17": safe(gp, rev),
-        "X18": safe(ebit, rev),
+    # Map computed ratios to column name patterns (fuzzy match)
+    ratio_map = {
+        "roa_c_before_interest_and_depreciation_before_interest": safe(ni + ie + dep, ta),
+        "roa_a_before_interest_and_after_tax": safe(ni + ie, ta),
+        "roa_b_before_interest_and_depreciation_after_tax": safe(ni + dep, ta),
+        "operating_gross_margin": safe(gp, rev),
+        "realized_sales_gross_margin": safe(gp, rev),
+        "operating_profit_rate": safe(ebit, rev),
+        "tax_pre_net_interest_rate": safe(ni, te),
+        "after_tax_net_interest_rate": safe(ni, ta),
+        "cash_flow_rate": safe(cfo, rev),
+        "interest_bearing_debt_interest_rate": safe(ie, td) if td else 0,
+        "tax_rate_a": 0.21,
+        "per_net_share_value_b": te,
+        "net_value_per_share_a": te,
+        "net_value_per_share_c": te,
+        "persistent_eps_in_the_last_four_seasons": ni,
+        "cash_flow_per_share": cfo,
+        "revenue_per_share_yuan": rev,
+        "operating_profit_per_share_yuan": ebit,
+        "per_share_net_profit_before_tax_yuan": ebit,
+        "realized_sales_gross_profit_growth_rate": 0.0,
+        "operating_profit_growth_rate": 0.0,
+        "after_tax_net_profit_growth_rate": 0.0,
+        "regular_net_profit_growth_rate": 0.0,
+        "continuous_net_profit_growth_rate": 0.0,
+        "total_asset_growth_rate": 0.0,
+        "net_value_growth_rate": 0.0,
+        "total_asset_return_growth_rate_ratio": 0.0,
+        "cash_reinvestment": safe(cfo, ta),
+        "current_ratio": safe(ca, cl),
+        "quick_ratio": safe(ca * 0.7, cl),
+        "interest_expense_ratio": safe(ie, rev),
+        "total_debt_total_net_worth": safe(td, te),
+        "debt_ratio": safe(tl, ta),
+        "net_worth_assets": safe(te, ta),
+        "long_term_fund_suitability_ratio_a": safe(te + (tl - cl), ta - ca) if (ta - ca) != 0 else 1.0,
+        "borrowing_dependency": safe(td, ta),
+        "contingent_liabilities_net_worth": 0.0,
+        "operating_profit_paid_in_capital": safe(ebit, te),
+        "net_profit_before_tax_paid_in_capital": safe(ebit, te),
+        "inventory_and_accounts_receivable_net_value": safe(ca * 0.5, te),
+        "total_asset_turnover": safe(rev, ta),
+        "accounts_receivable_turnover": safe(rev, ca * 0.2) if ca else 0,
+        "average_collection_days": safe(365 * ca * 0.2, rev) if rev else 0,
+        "inventory_turnover_rate_times": safe(rev * 0.6, ca * 0.3) if ca else 0,
+        "fixed_assets_turnover_frequency": safe(rev, ta - ca) if (ta - ca) != 0 else 0,
+        "net_worth_turnover_rate_times": safe(rev, te),
+        "revenue_per_person": rev,
+        "operating_profit_per_person": ebit,
+        "allocation_rate_per_person": rev,
+        "working_capital_to_total_assets": safe(wc, ta),
+        "quick_asset_total_asset": safe(ca * 0.7, ta),
+        "current_assets_total_assets": safe(ca, ta),
+        "cash_total_assets": safe(cash, ta),
+        "quick_asset_current_liabilities": safe(ca * 0.7, cl),
+        "cash_current_liability": safe(cash, cl),
+        "current_liability_to_assets": safe(cl, ta),
+        "operating_funds_to_liability": safe(cfo, tl),
+        "inventory_working_capital": safe(ca * 0.3, wc) if wc != 0 else 0,
+        "inventory_current_liability": safe(ca * 0.3, cl),
+        "current_liability_liability": safe(cl, tl),
+        "working_capital_equity": safe(wc, te),
+        "current_liability_equity": safe(cl, te),
+        "long_term_liability_to_current_assets": safe(tl - cl, ca),
+        "retained_earnings_total_assets": safe(re_val, ta),
+        "total_income_total_expense": safe(rev, rev - ni) if (rev - ni) != 0 else 1.0,
+        "total_expense_assets": safe(rev - ni, ta),
+        "current_asset_turnover_rate": safe(rev, ca),
+        "quick_asset_turnover_rate": safe(rev, ca * 0.7),
+        "working_capitcal_turnover_rate": safe(rev, wc) if wc != 0 else 0,
+        "cash_turnover_rate": safe(rev, cash),
+        "cash_flow_to_sales": safe(cfo, rev),
+        "fix_assets_to_assets": safe(ta - ca, ta),
+        "current_liability_to_liability": safe(cl, tl),
+        "current_liability_to_equity": safe(cl, te),
+        "equity_to_long_term_liability": safe(te, tl - cl) if (tl - cl) != 0 else 0,
+        "cash_flow_to_total_assets": safe(cfo, ta),
+        "cash_flow_to_liability": safe(cfo, tl),
+        "cfo_to_assets": safe(cfo, ta),
+        "cash_flow_to_equity": safe(cfo, te),
+        "current_liabilities_to_current_assets": safe(cl, ca),
+        "one_if_total_liabilities_exceeds_total_assets_zero_otherwise": 1 if tl > ta else 0,
+        "net_income_to_total_assets": safe(ni, ta),
+        "total_assets_to_gnp_price": ta / 1e9,
+        "no_credit_interval": safe(ca - cl, (rev - ni) / 365) if (rev - ni) != 0 else 0,
+        "gross_profit_to_sales": safe(gp, rev),
+        "net_income_to_stockholder_s_equity": safe(ni, te),
+        "liability_to_equity": safe(tl, te),
+        "degree_of_financial_leverage_dfl": safe(ebit, ebit - ie) if (ebit - ie) != 0 else 1.0,
+        "interest_coverage_ratio_interest_expense_to_ebit": safe(ebit, ie),
+        "one_if_net_income_was_negative_for_the_last_two_year_zero_otherwise": 1 if ni < 0 else 0,
+        "equity_to_liability": safe(te, tl),
+        "non_industry_income_and_expenditure_revenue": 0.0,
+        "continuous_interest_rate_after_tax": safe(ni, ta),
+        "operating_expense_rate": safe(rev - gp, rev),
+        "research_and_development_expense_rate": 0.0,
     }
 
-    # ── Poland features (Attr1-64) ──
-    poland_map = {
-        "Attr1": safe(ni, ta),
-        "Attr2": safe(tl, ta),
-        "Attr3": safe(wc, ta),
-        "Attr4": safe(ca, cl),
-        "Attr5": safe(re_val, ta),
-        "Attr6": safe(ebit, ta),
-        "Attr7": safe(te, tl),
-        "Attr8": safe(rev, ta),
-        "Attr9": safe(ni, rev),
-        "Attr10": safe(te, ta),
-        "Attr11": safe(cfo, rev),
-        "Attr12": safe(gp, rev),
-        "Attr13": safe(ebit, ie),
-        "Attr14": safe(ni, te),
-        "Attr15": safe(td, te),
-        "Attr16": safe(cfo, tl),
-        "Attr17": safe(ca, ta),
-        "Attr18": safe(cl, ta),
-        "Attr19": safe(ebit + dep, tl),
-        "Attr20": safe(rev, ca),
-        "Attr21": safe(cfo, ta),
-        "Attr22": safe(ni + dep, td),
-        "Attr23": safe(cl, tl),
-        "Attr24": safe(wc, rev),
-        "Attr27": safe(ni, ebit),
-        "Attr34": safe(cfo, cl),
-        "Attr37": safe(ta - ca, ta),
-        "Attr38": safe(cl, te),
-        "Attr39": safe(ni, rev),
-        "Attr44": safe(ca - cl, rev - gp) if (rev - gp) != 0 else np.nan,
-        "Attr55": safe(wc, ta),
-        "Attr58": safe(td, ta),
-        "Attr59": safe(cfo, rev),
-        "Attr60": safe(rev, ta),
-    }
-
-    # ── Taiwan features (named columns) ──
-    # Match by checking if these substrings appear in the actual column names
-    taiwan_ratio_map = {
-        "current ratio": safe(ca, cl),
-        "quick ratio": safe(ca * 0.7, cl),
-        "debt ratio": safe(tl, ta),
-        "total debt/total net worth": safe(td, te),
-        "interest expense ratio": safe(ie, rev),
-        "working capital to total assets": safe(wc, ta),
-        "current assets/total assets": safe(ca, ta),
-        "cash / total assets": safe(cash, ta),
-        "Retained Earnings/Total assets": safe(re_val, ta),
-        "current liability to assets": safe(cl, ta),
-        "net income to total assets": safe(ni, ta),
-        "Cash flow to Sales": safe(cfo, rev),
-        "Cash flow to total assets": safe(cfo, ta),
-        "cash flow to liability": safe(cfo, tl),
-        "CFO to ASSETS": safe(cfo, ta),
-        "total asset turnover": safe(rev, ta),
-        "operating gross margin": safe(gp, rev),
-        "Net income to stockholder": safe(ni, te),
-        "equity to liability": safe(te, tl),
-        "Interest coverage ratio": safe(ebit, ie),
-        "current liability / liability": safe(cl, tl),
-        "current liability/equity": safe(cl, te),
-        "Gross profit to Sales": safe(gp, rev),
-        "liability to equity": safe(tl, te),
-        "ROA(C) before interest and depreciation before interest": safe(ni + ie + dep, ta),
-        "ROA(A) before interest and % after tax": safe(ni + ie, ta),
-        "net worth/assets": safe(te, ta),
-        "borrowing dependency": safe(td, ta),
-        "fix assets to assets": safe(ta - ca, ta),
-        "cash reinvestment": safe(cfo, ta),
-        "cash / current liability": safe(cash, cl),
-        "Quick asset /current liabilities": safe(ca * 0.7, cl),
-        "Quick asset/Total asset": safe(ca * 0.7, ta),
-        "operating funds to liability": safe(cfo, tl),
-        "cash flow to equity": safe(cfo, te),
-        "current liabilities to current assets": safe(cl, ca),
-        "working capital/equity": safe(wc, te),
-        "long-term liability to current assets": safe(tl - cl, ca),
-        "equity to long-term liability": safe(te, tl - cl) if (tl - cl) != 0 else np.nan,
-        "Degree of financial leverage": safe(ebit, ebit - ie) if (ebit - ie) != 0 else np.nan,
-        "total expense /assets": safe(rev - ni, ta),
-        "total income / total expense": safe(rev, rev - ni) if (rev - ni) != 0 else np.nan,
-        "total asset growth rate": 0.0,
-        "one if total liabilities exceeds total assets": 1.0 if tl > ta else 0.0,
-        "one if net income was negative": 1.0 if ni < 0 else 0.0,
-    }
-
-    # ── Apply all mappings ──
     mapped = 0
-
-    # Direct column name matches (US, Poland)
-    for col_name, val in {**us_map, **poland_map}.items():
-        if col_name in row and val is not None and not (isinstance(val, float) and np.isnan(val)):
-            row[col_name] = val
+    for norm_key, value in ratio_map.items():
+        # Direct match
+        if norm_key in norm_to_original:
+            row[norm_to_original[norm_key]] = value
             mapped += 1
-
-    # Fuzzy match for Taiwan columns (column names are messy with spaces/special chars)
-    for feature_col in feature_columns:
-        if not (isinstance(row[feature_col], float) and np.isnan(row[feature_col])):
-            continue  # already mapped
-        col_lower = feature_col.strip().lower()
-        for pattern, val in taiwan_ratio_map.items():
-            if val is None or (isinstance(val, float) and np.isnan(val)):
-                continue
-            if pattern.lower() in col_lower or col_lower in pattern.lower():
-                row[feature_col] = val
-                mapped += 1
-                break
+            continue
+        # Fuzzy: check if key is substring of any column or vice versa
+        for norm_orig, orig_col in norm_to_original.items():
+            if len(norm_key) > 5 and len(norm_orig) > 5:
+                if norm_key in norm_orig or norm_orig in norm_key:
+                    row[orig_col] = value
+                    mapped += 1
+                    break
 
     df = pd.DataFrame([row])[feature_columns]
-    logger.info(f"Mapped {mapped} features from user inputs")
+    if scaler is not None:
+        df = pd.DataFrame(scaler.transform(df), columns=feature_columns)
+
+    logger.info(f"Mapped {mapped} features")
     return df, mapped
 
 
-# ─── Altman Z-Score ──────────────────────────────────────────────────────────
 def compute_altman_z(data: dict) -> dict:
     ta = data.get("totalAssets", 0) or 1
     tl = data.get("totalLiabilities", 0) or 1
@@ -443,7 +375,6 @@ def compute_altman_z(data: dict) -> dict:
     }
 
 
-# ─── Request / Response ─────────────────────────────────────────────────────
 class FinancialInput(BaseModel):
     companyName: str = "Unknown Company"
     totalAssets: float = 0
@@ -472,7 +403,6 @@ class PredictionResponse(BaseModel):
     model_loaded: bool
 
 
-# ─── Endpoints ───────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     success = train_model()
@@ -506,12 +436,11 @@ async def predict(inputs: FinancialInput):
     features_mapped = 0
     features_total = model_metrics.get("features", 0) if model_metrics else 0
 
-    if trained_model is not None and preproc is not None:
+    if trained_model is not None:
         try:
-            df_raw, features_mapped = map_user_inputs_to_features(data)
-            df_transformed = preproc.transform(df_raw)
-            proba = trained_model.predict_proba(df_transformed)
-            pred = trained_model.predict(df_transformed)
+            df, features_mapped = map_user_inputs_to_features(data)
+            proba = trained_model.predict_proba(df)
+            pred = trained_model.predict(df)
 
             model_pred = {
                 "probability_bankrupt": round(float(proba[0][1]), 4),
@@ -541,9 +470,6 @@ async def model_info_endpoint():
     return {
         "model_loaded": trained_model is not None,
         "metrics": model_metrics,
-        "training_approach": "LightGBM + SMOTE + early stopping, trained on startup",
-        "dataset": "Combined: US + Taiwan + Poland (128,906 companies)",
+        "training_approach": "LightGBM + SMOTE + StandardScaler, trained on startup",
+        "dataset": "Taiwan Bankruptcy Prediction (6,819 companies, 95 financial ratios)",
     }
-
-
-# Frontend served separately (Vercel/Netlify/etc.)
